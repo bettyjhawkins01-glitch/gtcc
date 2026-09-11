@@ -5,7 +5,7 @@ import {
   incUserUsageToday, trackLookup, saveStats
 } from './stats.js'
 import {
-  normalize, fmtStart, fmtError, fmtLoading, fmtResult,
+  normalize, fmtStart, fmtMyLimit, fmtError, fmtLoading, fmtResult,
   fmtQuota, fmtProfile, fmtAdmin, fmtListLimit, esc
 } from './formatter.js'
 
@@ -46,6 +46,33 @@ async function edit(chatId, messageId, text, extra = {}) {
   })
 }
 
+async function safeEdit(chatId, messageId, text, extra = {}) {
+  try {
+    return await edit(chatId, messageId, text, extra)
+  } catch (e) {
+    const msg = String(e?.message || e).toLowerCase()
+
+    // Telegram can occasionally lose/delete the temporary loading message.
+    // If that happens, never fail the whole lookup — just send a fresh message.
+    if (
+      msg.includes('message to edit not found') ||
+      msg.includes('message can\'t be edited') ||
+      msg.includes('message is not modified')
+    ) {
+      if (msg.includes('message is not modified')) return null
+      return send(chatId, text, extra)
+    }
+
+    // Generic fallback also prevents a successful lookup from being hidden
+    // just because Telegram rejected an edit operation.
+    try {
+      return await send(chatId, text, extra)
+    } catch {
+      throw e
+    }
+  }
+}
+
 async function sendPhoto(chatId, photo, caption) {
   return api('sendPhoto', {
     chat_id: chatId,
@@ -56,14 +83,19 @@ async function sendPhoto(chatId, photo, caption) {
 }
 
 function keyboard(isAdmin) {
-  const rows = [[
-    { text: '📊 Limit Saya', callback_data: 'my_limit' },
-    { text: 'ℹ️ Cara Pakai', callback_data: 'help' }
-  ]]
-  if (isAdmin) rows.push([
-    { text: '👑 Admin', callback_data: 'admin' },
-    { text: '💎 GTC Quota', callback_data: 'gtc_quota' }
-  ])
+  const rows = [
+    [{ text: '🎟  KUOTA SAYA', callback_data: 'my_limit' }],
+    [
+      { text: '🔎 Cara Cek', callback_data: 'help' },
+      { text: '🏠 Menu Utama', callback_data: 'home' }
+    ]
+  ]
+  if (isAdmin) {
+    rows.unshift([
+      { text: '👑 Dashboard', callback_data: 'admin' },
+      { text: '💎 GTC Quota', callback_data: 'gtc_quota' }
+    ])
+  }
   return { inline_keyboard: rows }
 }
 
@@ -121,11 +153,11 @@ async function lookup(msg, text) {
       const pb = await gtc('/v2.8/search', { countryCode: 'id', phoneNumber: phone, source: 'search', token: creds.token })
       const code = pb?.meta?.httpStatusCode
       if (code !== 200 && code != null) {
-        await edit(chatId, loading.message_id, fmtError(pb?.meta?.errorMessage || 'Unknown'))
+        await safeEdit(chatId, loading.message_id, fmtError(pb?.meta?.errorMessage || 'Unknown'))
         continue
       }
       if (!pb?.result?.profile) {
-        await edit(chatId, loading.message_id, fmtError('Nomor tidak ditemukan'))
+        await safeEdit(chatId, loading.message_id, fmtError('Nomor tidak ditemukan'))
         continue
       }
 
@@ -137,16 +169,26 @@ async function lookup(msg, text) {
       const { text: resultText, imageUrl } = fmtResult(phone, pb, tb, limitInfo)
       if (imageUrl) {
         try {
-          await api('deleteMessage', { chat_id: chatId, message_id: loading.message_id })
+          // Send the final result first. Only delete the loading message after
+          // the photo was delivered successfully.
           await sendPhoto(chatId, imageUrl, resultText)
+          try {
+            await api('deleteMessage', {
+              chat_id: chatId,
+              message_id: loading.message_id
+            })
+          } catch {
+            // Loading message disappearing is harmless.
+          }
         } catch {
-          await edit(chatId, loading.message_id, resultText)
+          // If Telegram cannot fetch/send the image, fall back to text.
+          await safeEdit(chatId, loading.message_id, resultText)
         }
       } else {
-        await edit(chatId, loading.message_id, resultText)
+        await safeEdit(chatId, loading.message_id, resultText)
       }
     } catch (e) {
-      await edit(chatId, loading.message_id, fmtError(friendlyErr(e)))
+      await safeEdit(chatId, loading.message_id, fmtError(friendlyErr(e)))
     }
   }
 }
@@ -164,7 +206,7 @@ async function handleCommand(msg, text) {
     const used = getUserUsageToday(uid), lim = getUserLimit(uid)
     const left = lim < 0 ? '∞' : Math.max(0, lim - used)
     const max = lim < 0 ? '∞' : lim
-    return send(chatId, `📊 <b>Limit kamu</b>\nTerpakai: ${used}\nSisa: ${left}/${max}`)
+    return send(chatId, fmtMyLimit(used, lim), { reply_markup: keyboard(admin) })
   }
 
   if (!admin) return send(chatId, '⛔ Command ini khusus admin.')
@@ -260,19 +302,36 @@ async function handleCallback(q) {
   try { await api('answerCallbackQuery', { callback_query_id: q.id }) } catch {}
   const msg = q.message
   const uid = String(q.from.id)
-  if (q.data === 'help') return send(msg.chat.id, '🔎 Kirim nomor HP langsung ke bot.\nContoh: <code>628123456789</code>')
+  if (q.data === 'help') return send(
+    msg.chat.id,
+    '╭──────────────────────╮\n' +
+    '      <b>🔎 CARA CEK</b>\n' +
+    '╰──────────────────────╯\n\n' +
+    'Kirim nomor HP langsung ke bot:\n' +
+    '<code>081234567890</code>\n' +
+    '<code>6281234567890</code>\n' +
+    '<code>+6281234567890</code>\n\n' +
+    '<i>Satu pesan juga bisa berisi beberapa nomor.</i>',
+    { reply_markup: keyboard(isAdminId(uid)) }
+  )
+  if (q.data === 'home') {
+    const used = getUserUsageToday(uid)
+    const max = getUserLimit(uid)
+    const name = q.from.first_name || q.from.username || 'kawan'
+    return send(msg.chat.id, fmtStart(name, used, max, isAdminId(uid)), { reply_markup: keyboard(isAdminId(uid)) })
+  }
   if (q.data === 'my_limit') {
     const used = getUserUsageToday(uid), lim = getUserLimit(uid)
     const left = lim < 0 ? '∞' : Math.max(0, lim - used)
     const max = lim < 0 ? '∞' : lim
-    return send(msg.chat.id, `📊 <b>Limit kamu</b>\nTerpakai: ${used}\nSisa: ${left}/${max}`)
+    return send(msg.chat.id, fmtMyLimit(used, lim), { reply_markup: keyboard(isAdminId(uid)) })
   }
   if (!isAdminId(uid)) return
-  if (q.data === 'admin') return send(msg.chat.id, fmtAdmin())
+  if (q.data === 'admin') return send(msg.chat.id, fmtAdmin(), { reply_markup: keyboard(true) })
   if (q.data === 'gtc_quota') {
     try {
       const b = await gtc('/v2.8/subscription', { token: getCreds().token })
-      return send(msg.chat.id, fmtQuota(b))
+      return send(msg.chat.id, fmtQuota(b), { reply_markup: keyboard(true) })
     } catch (e) { return send(msg.chat.id, fmtError(friendlyErr(e))) }
   }
 }
