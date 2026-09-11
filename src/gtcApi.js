@@ -12,14 +12,77 @@ import { ts, sig, enc, dec } from './crypto.js'
 
 // ── shared cred state (mutable, di-reload setelah relogin) ────────────────
 let _creds = null
+
+function emptyStore() {
+  return { active: null, credentials: {} }
+}
+
+function sessionError(message) {
+  const e = new Error(message)
+  e.code = 'GTC_SESSION_MISSING'
+  return e
+}
+
 export function loadCreds() {
-  const store = JSON.parse(fs.readFileSync(CRED_FILE, 'utf8'))
-  const c = store.credentials[store.active]
-  _creds = { store, token: c.token, finalKey: c.finalKey, deviceId: c.clientDeviceId }
+  _creds = null
+
+  if (!CRED_FILE) {
+    throw sessionError('Session GTC belum dikonfigurasi. Admin perlu login ulang.')
+  }
+
+  if (!fs.existsSync(CRED_FILE)) {
+    fs.mkdirSync(path.dirname(CRED_FILE), { recursive: true })
+    fs.writeFileSync(CRED_FILE, JSON.stringify(emptyStore(), null, 2))
+    throw sessionError('Session GTC belum aktif. Admin silakan /relogin.')
+  }
+
+  let store
+  try {
+    const raw = fs.readFileSync(CRED_FILE, 'utf8').trim()
+    store = raw ? JSON.parse(raw) : emptyStore()
+  } catch {
+    throw sessionError('File session GTC tidak valid. Admin silakan /relogin.')
+  }
+
+  if (!store || typeof store !== 'object') store = emptyStore()
+  if (!store.credentials || typeof store.credentials !== 'object') store.credentials = {}
+
+  const active = store.active
+  const c = active ? store.credentials[active] : null
+
+  if (!active || !c) {
+    throw sessionError('Session GTC belum aktif. Admin silakan /relogin.')
+  }
+
+  const token = typeof c.token === 'string' ? c.token.trim() : ''
+  const finalKey = typeof c.finalKey === 'string' ? c.finalKey.trim() : ''
+  const deviceId = typeof c.clientDeviceId === 'string' ? c.clientDeviceId.trim() : ''
+
+  if (!token || !finalKey || !deviceId) {
+    throw sessionError('Credential GTC belum lengkap. Admin silakan /relogin.')
+  }
+
+  _creds = { store, token, finalKey, deviceId }
   return _creds
 }
-export function reloadCreds() { return loadCreds() }
-export function getCreds()    { return _creds || loadCreds() }
+
+export function reloadCreds() {
+  _creds = null
+  return loadCreds()
+}
+
+export function getCreds() {
+  return _creds || loadCreds()
+}
+
+export function hasCreds() {
+  try {
+    getCreds()
+    return true
+  } catch {
+    return false
+  }
+}
 
 // ── crypto helpers lokal (VFK pakai FINAL_KEY sendiri) ────────────────────
 function pad(b) { const n = 16 - b.length % 16; return Buffer.concat([b, Buffer.alloc(n, n)]) }
@@ -41,7 +104,11 @@ function vfkSig(t, raw) {
 
 // ── GTC request helpers ────────────────────────────────────────────────────
 export async function gtc(endpoint, payload) {
-  const { token, finalKey, deviceId } = getCreds()
+  const creds = getCreds()
+  if (!creds?.token || !creds?.finalKey || !creds?.deviceId) {
+    throw sessionError('Session GTC belum aktif. Admin silakan /relogin.')
+  }
+  const { token, finalKey, deviceId } = creds
   const raw = JSON.stringify(payload), t = ts()
   const h = {
     'Content-Type': 'application/json', 'x-os': 'android 9', 'x-app-version': '8.4.0',
